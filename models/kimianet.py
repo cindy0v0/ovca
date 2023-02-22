@@ -7,5 +7,4 @@ class KimiaNet(nn.Module):
         super(KimiaNet, self).__init__()
         self.model = torchvision.models.densenet121()
         
-        self.model.load_state_dict(torch.load('/projects/ovcare/classification/Ali/Ovarian_project/Pytorch_Codes/KimiaNet/KimiaNetPyTorchWeights.pth'))
-
+        self.model.load_state_dict(torch.load('/projects/ovcare/classification/Ali/Ovarian_project/Pytorch_Codes/KimiaNet/KimiaNetPyTorchWeights.pth')) # test
