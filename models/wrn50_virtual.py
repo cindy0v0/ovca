@@ -18,7 +18,7 @@ class WideResNet50_2(nn.Module):
                     param.requires_grad = False
 
     def forward(self, x):
-        print(f"x shape: {x.shape}")
+        # print(f"x shape: {x.shape}")
         x = x.type(torch.cuda.FloatTensor)
         x = self.model.conv1(x)
         x = self.model.bn1(x)
@@ -30,5 +30,5 @@ class WideResNet50_2(nn.Module):
         x = self.model.layer4(x)
         x = self.model.avgpool(x)
         x = x.view(x.size(0), -1)
-        print(f"x shape before fc: {x.shape}")
-        return {"x": self.model.fc(x), "out": x}
+        # print(f"x shape before fc: {x.shape}")
+        return {"x": self.model.fc(x), "output": x}

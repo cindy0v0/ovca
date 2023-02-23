@@ -15,9 +15,10 @@ import pdb
 class OVCA(Dataset):
     def __init__(self, img_json, chunk, transform=None, target_transform=None, idx_to_label=None, key_word='Tumor'):
         '''
-        Class with images as a list of patch paths, labels as a list of int label indices, and dictionary idx_to_label
+        Class with images as a list of patch paths, labels as a list of int label indices, and dictionary idx_to_label. keyword Tumor is used to parse for histotypes in patch path
+        stores self.images as [image paths]
         '''
-        label_to_index = {v: k for k, v in idx_to_label.items()}
+        label_to_index = {v: k for k, v in enumerate(idx_to_label)}
         with open(img_json) as f:
             data = json.load(f)
             self.images = data['chunks'][chunk]['imgs']
@@ -32,16 +33,32 @@ class OVCA(Dataset):
 
     def __getitem__(self, idx):
         label = self.labels[idx]
-        print("?")
         image = Image.open(self.images[idx])
-        print(type(image))
-        pdb.set_trace()
         if self.transform:
             image = self.transform(image)
-            pdb.set_trace()
         if self.target_transform:
             label = self.target_transform(label)
         return image, label
         # return {'imgs': img, 'labels': label}
 
+class OVMIL(Dataset):
+    '''
+    init effects
+    dataset             directory of .pt files, nb_patch x embedding_size, 1 per slide. Naming convention: patient_id, histotype <-- should prioritize batches from the same patient = ordered dir & shuffle=False
+    batch_size          size to pad nb_patch if < batch_size
+    label_to_idx        reverse mapping of histotypes
+
+    getitem returns
+    patches             padded .pt
+    labels              parse from name
+    '''
+    def __init__(self, dataset, batch_size, histotypes): 
+        pass
+
+    def __len__(self):
+        return 0
+
+    def __getitem__(self, idx): 
+        return None
+        
 

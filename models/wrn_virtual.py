@@ -116,7 +116,7 @@ class WideResNet(nn.Module):
         out = out.view(-1, self.nChannels) 
         print(f"x shape after view: {out.shape}") # 
         print(f"returned shape: {self.fc(out).shape}, nChannel: {self.nChannels}") # ? 
-        return {"x": self.fc(out), "out": out}
+        return {"x": self.fc(out), "output": out}
 
     def intermediate_forward(self, x, layer_index):
         print(f"intermediate forward is called?!!")
