@@ -146,10 +146,11 @@ logistic_regression = torch.nn.Linear(1, 2)
 logistic_regression = logistic_regression.cuda()
 
 # Initialize optim
-optimizer = torch.optim.SGD(
+optimizer = torch.optim.Adam(
     list(net.parameters()) + list(weight_energy.parameters()) + \
-    list(logistic_regression.parameters()), state['learning_rate'], momentum=state['momentum'],
-    weight_decay=state['decay'], nesterov=True)
+    list(logistic_regression.parameters()), state['learning_rate'], #momentum=state['momentum'],
+    weight_decay=state['decay'], #nesterov=True
+    )
 
 def cosine_annealing(step, total_steps, lr_max, lr_min):
     return lr_min + (lr_max - lr_min) * 0.5 * (
@@ -191,7 +192,7 @@ def log_sum_exp(value, dim=None, keepdim=False):
 '''
 !!! Debugging 
 '''
-# sample = next(iter(train_loader))
+sample = next(iter(train_loader))
 
 # Training
 def train(epoch):
