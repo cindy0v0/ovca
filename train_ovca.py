@@ -87,17 +87,16 @@ std = [x / 255 for x in [28.79, 33.26, 18.41]]
 # Create dataloaders
 train_transform = trn.Compose([trn.RandomHorizontalFlip(), trn.RandomVerticalFlip(), trn.RandomResizedCrop(512, scale=(0.9, 1.0), ratio=(0.95, 1.05)), # should use to avoid overfitting
                                trn.ToTensor(), trn.Normalize(mean, std)])
-train_no_transform = trn.Compose([trn.ToTensor(), trn.Normalize(mean, std)])
 test_transform = trn.Compose([trn.ToTensor(), trn.Normalize(mean, std)])
 
 if args.dataset == 'ovca':
     labels = args.histotypes
     num_classes = len(labels)
-    class_weights = class_proportion(args.split_dir, args.histotypes)
+    class_weights = class_proportion(args.split_dir, args.histotypes).to('cuda')
 
-    train_data = OVCA(args.split_dir, chunk=0, transform=train_transform, target_transform=None, idx_to_label=labels, key_word='Tumor', default_transform=train_no_transform)
-    val_data = OVCA(args.split_dir, chunk=1, transform=test_transform, target_transform=None, idx_to_label=labels, key_word='Tumor')
-    test_data = OVCA(args.split_dir, chunk=2, transform=test_transform, target_transform=None, idx_to_label=labels, key_word='Tumor')
+    train_data = OVCA(args.split_dir, chunk=0, train_transform=train_transform, target_transform=None, test_transform=test_transform, idx_to_label=labels, key_word='Tumor')
+    val_data = OVCA(args.split_dir, chunk=1, test_transform=test_transform, target_transform=None, idx_to_label=labels, key_word='Tumor')
+    test_data = OVCA(args.split_dir, chunk=2, test_transform=test_transform, target_transform=None, idx_to_label=labels, key_word='Tumor')
 
 train_loader = torch.utils.data.DataLoader(
     train_data, batch_size=args.batch_size, shuffle=True, # TODO : debug
@@ -337,7 +336,7 @@ def train(epoch):
         # backward
         optimizer.zero_grad()
 
-        loss = F.cross_entropy(x, target)
+        loss = F.cross_entropy(x, target, weight=class_weights)
         loss += args.loss_weight * lr_reg_loss
         loss.backward()
 
@@ -363,6 +362,7 @@ if __name__ == '__main__':
                                 str(args.select) + '_' + str(args.sample_from) +
                                 '_training_results.csv'), 'w') as f:
         f.write('epoch,time(s),train_loss,val_loss,val_error(%)\n')
+
 
 
     for epoch in range(start_epoch, args.epochs):
