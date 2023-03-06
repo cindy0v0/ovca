@@ -10,8 +10,10 @@ import torchvision.datasets as dset
 import torch.nn.functional as F
 from tqdm import tqdm
 
+import pdb
 from mil.varmil import VarMIL
 from ovca import OVCA, OVMIL
+from utils_ovca import class_proportion
 from models.allconv import AllConvNet
 from models.kimianet_virtual import KimiaNet
 from models.wrn50_virtual import WideResNet50_2
@@ -25,7 +27,7 @@ if __package__ is None:
 
 parser = argparse.ArgumentParser(description='Trains a VOS-OVCA Classifier',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-parser.add_argument('--dataset', type=str, choices=['ovca'],                                # TODO
+parser.add_argument('--dataset', type=str, choices=['ovca'],
                     default='ovca',
                     help='')
 parser.add_argument('--split_dir', type=str, default='', 
@@ -34,6 +36,7 @@ parser.add_argument('--histotypes', action='store', type=str, nargs="+",
                     help='space separated str IDs specifying histotype labels')
 parser.add_argument('--num_split', type=int, default=0,
                     help='index of current split, e.g. 0-2 for 3-fold cv')
+parser.add_argument('--freeze', type=bool, default=False)
 parser.add_argument('--unfreeze_epoch', type=int, default=40,
                     help='epoch at which to unfreeze pretrained layers')
 parser.add_argument('--seed', type=int, default=1,
@@ -44,7 +47,7 @@ parser.add_argument('--model', '-m', type=str, default='wrn',
 #                     help='Train a model to be used for calibration. This holds out some data for validation.')
 # Optimization options
 parser.add_argument('--epochs', '-e', type=int, default=100, help='Number of epochs to train.')
-parser.add_argument('--learning_rate', '-lr', type=float, default=0.1, help='The initial learning rate.')
+parser.add_argument('--learning_rate', '-lr', type=float, default=0.001, help='The initial learning rate.')
 parser.add_argument('--batch_size', '-b', type=int, default=128, help='Batch size.')
 parser.add_argument('--test_bs', type=int, default=200)
 parser.add_argument('--momentum', type=float, default=0.9, help='Momentum.')
@@ -54,7 +57,7 @@ parser.add_argument('--layers', default=40, type=int, help='total number of laye
 parser.add_argument('--widen-factor', default=2, type=int, help='widen factor')
 parser.add_argument('--droprate', default=0.3, type=float, help='dropout probability')
 # Checkpoints
-parser.add_argument('--save', '-s', type=str, default='./snapshots/baseline', help='Folder to save checkpoints.')
+parser.add_argument('--save', '-s', type=str, default='./snapshots/ovca', help='Folder to save checkpoints.')
 parser.add_argument('--load', '-l', type=str, default='', help='Checkpoint path to resume / test.')
 parser.add_argument('--test', '-t', action='store_true', help='Test only flag.')
 # Acceleration
@@ -84,18 +87,20 @@ std = [x / 255 for x in [28.79, 33.26, 18.41]]
 # Create dataloaders
 train_transform = trn.Compose([trn.RandomHorizontalFlip(), trn.RandomVerticalFlip(), trn.RandomResizedCrop(512, scale=(0.9, 1.0), ratio=(0.95, 1.05)), # should use to avoid overfitting
                                trn.ToTensor(), trn.Normalize(mean, std)])
+train_no_transform = trn.Compose([trn.ToTensor(), trn.Normalize(mean, std)])
 test_transform = trn.Compose([trn.ToTensor(), trn.Normalize(mean, std)])
 
 if args.dataset == 'ovca':
     labels = args.histotypes
     num_classes = len(labels)
+    class_weights = class_proportion(args.split_dir, args.histotypes)
 
-    train_data = OVCA(args.split_dir, chunk=0, transform=train_transform, target_transform=None, idx_to_label=labels, key_word='Tumor')
+    train_data = OVCA(args.split_dir, chunk=0, transform=train_transform, target_transform=None, idx_to_label=labels, key_word='Tumor', default_transform=train_no_transform)
     val_data = OVCA(args.split_dir, chunk=1, transform=test_transform, target_transform=None, idx_to_label=labels, key_word='Tumor')
     test_data = OVCA(args.split_dir, chunk=2, transform=test_transform, target_transform=None, idx_to_label=labels, key_word='Tumor')
 
 train_loader = torch.utils.data.DataLoader(
-    train_data, batch_size=args.batch_size, shuffle=False, # TODO 
+    train_data, batch_size=args.batch_size, shuffle=True, # TODO : debug
     num_workers=args.prefetch, pin_memory=True)
 test_loader = torch.utils.data.DataLoader(
     test_data, batch_size=args.test_bs, shuffle=False, 
@@ -109,19 +114,16 @@ if args.model == 'allconv':
     net = AllConvNet(num_classes)
     num_channels = 0 # TODO
 elif args.model == 'kimia':
-    net = KimiaNet(num_classes)
+    net = KimiaNet(num_classes, freeze=False)
     num_channels = net.model.classifier.in_features # embedding dimension
 else:
-    net = WideResNet50_2(num_classes=num_classes, freeze=True)
+    net = WideResNet50_2(num_classes=num_classes, freeze=False)
     num_channels = net.model.fc.in_features # embedding dimension
 
-# start_epoch = 0 ???
-split_indicator = str(args.num_split)
-
-# TODO: restore model is desired
+split_indicator = '_' + str(args.num_split)
 
 # Initialize GPU
-# TODO: 
+# TODO: distributedparallel
 # import torch.distributed as dist6
 # import torch.multiprocessing as mp
 if args.ngpu > 1:
@@ -131,7 +133,14 @@ if args.ngpu > 0:
     net.cuda()
     torch.cuda.manual_seed(args.seed)
 
-# TODO
+# restore model 
+start_epoch = 0
+if not args.load == '':
+    net.load_state_dict(torch.load(args.load))
+    i = args.load[-4]
+    print('Model restored! Epoch:', i)
+    start_epoch = i + 1
+
 cudnn.benchmark = True  # find algorithms for best runtime
 
 # Initialize VOS components = weight_energy and logistic_regression <-- extract? 
@@ -141,7 +150,7 @@ data_dict = torch.zeros(num_classes, args.sample_number, num_channels).cuda()
 number_dict = {}
 for i in range(num_classes):
     number_dict[i] = 0
-eye_matrix = torch.eye(num_channels, device='cuda') # was 128, num_channel replacement here is correct
+eye_matrix = torch.eye(num_channels, device='cuda') # was 128, replaced with num_channel 
 logistic_regression = torch.nn.Linear(1, 2)
 logistic_regression = logistic_regression.cuda()
 
@@ -152,22 +161,8 @@ optimizer = torch.optim.Adam(
     weight_decay=state['decay'], #nesterov=True
     )
 
-def cosine_annealing(step, total_steps, lr_max, lr_min):
-    return lr_min + (lr_max - lr_min) * 0.5 * (
-            1 + np.cos(step / total_steps * np.pi))
-
-scheduler = torch.optim.lr_scheduler.LambdaLR(
-    optimizer,
-    lr_lambda=lambda step: cosine_annealing(
-        step,
-        args.epochs * len(train_loader),
-        1,  # since lr_lambda computes multiplicative factor
-        1e-6 / args.learning_rate))
-
 def log_sum_exp(value, dim=None, keepdim=False):
     """Numerically stable implementation of the operation
-
-    Requires: global var weight_energy
 
     value.exp().sum(dim, keepdim).log()
     """
@@ -188,29 +183,70 @@ def log_sum_exp(value, dim=None, keepdim=False):
         # else:
         return m + torch.log(sum_exp)
 
+# test function
+def test():
+    net.eval()
+    loss_avg = 0.0
+    correct = 0
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.cuda(), target.cuda()
 
-'''
-!!! Debugging 
-'''
-sample = next(iter(train_loader))
+            # forward
+            output, _ = net(data)
+            loss = F.cross_entropy(output, target)
+
+            # accuracy
+            pred = output.data.max(1)[1]
+            correct += pred.eq(target.data).sum().item()
+
+            # test loss average
+            loss_avg += float(loss.data)
+
+    state['test_loss'] = loss_avg / len(test_loader)
+    state['test_accuracy'] = correct / len(test_loader.dataset)
+
+# validate function
+def val():
+    net.eval()
+    loss_avg = 0.0
+    correct = 0
+    with torch.no_grad():
+        for data, target in val_loader:
+            data, target = data.cuda(), target.cuda()
+
+            # forward
+            output, _ = net(data)
+            loss = F.cross_entropy(output, target)
+
+            # accuracy
+            pred = output.data.max(1)[1]
+            correct += pred.eq(target.data).sum().item()
+
+            # test loss average
+            loss_avg += float(loss.data)
+
+    state['val_loss'] = loss_avg / len(val_loader)
+    state['val_accuracy'] = correct / len(val_loader.dataset)
+
+
+
+# sample = next(iter(train_loader))
 
 # Training
 def train(epoch):
-    net.train()  # enter train mode
+    # unfreeze training if frozen
+    if args.freeze and epoch >= args.unfreeze_epoch:
+        for name, param in net.module.model.named_parameters():
+                param.requires_grad = True
+
+    net.train()  
     loss_avg = 0.0
-    i = 0
     for data, target in train_loader:
-        '''
-        !!! 
-        '''
-        i += 1
-        # data, target = sample
         data, target = data.cuda(), target.cuda()
 
-
         # forward
-        out_dict = net.forward(data)
-        x, output = out_dict['x'], out_dict['output']
+        x, output = net(data)
 
         # energy regularization.
         '''
@@ -268,12 +304,12 @@ def train(epoch):
                 # energy_score_for_fg = 1 * torch.logsumexp(predictions[0][selected_fg_samples][:, :-1] / 1, 1)
                 energy_score_for_fg = log_sum_exp(x, 1)
                 if args.model == 'kimia':
-                    predictions_ood = net.model.classifier(ood_samples)
+                    predictions_ood = net.module.model.classifier(ood_samples)
                 elif args.model == 'wrn':
-                    predictions_ood = net.model.fc(ood_samples)
+                    predictions_ood = net.module.model.fc(ood_samples)
                 else: # args.model == 'allconv
                     predictions_ood = net.fc(ood_samples) 
-                # TODO: not good!!!
+                # TODO: not good!
 
                 # energy_score_for_bg = 1 * torch.logsumexp(predictions_ood[0][:, :-1] / 1, 1)
                 energy_score_for_bg = log_sum_exp(predictions_ood, 1)
@@ -286,8 +322,10 @@ def train(epoch):
                 output1 = logistic_regression(input_for_lr.view(-1, 1))
                 lr_reg_loss = criterion(output1, labels_for_lr.long())
 
-                if epoch % 10 == 0:
-                    print(f"lr_reg_loss for id ood classification: {lr_reg_loss}")
+                # if torch.isnan(lr_reg_loss):
+                #     print(f"nan! energy_score: {energy_score_for_bg}, {energy_score_for_fg}, i: {i}, epoch: {epoch}")
+                #     pdb.set_trace()
+
         else:
             target_numpy = target.cpu().data.numpy()
             for index in range(len(target)):
@@ -297,22 +335,16 @@ def train(epoch):
                     number_dict[dict_key] += 1
 
         # backward
-
         optimizer.zero_grad()
+
         loss = F.cross_entropy(x, target)
-        # breakpoint()
         loss += args.loss_weight * lr_reg_loss
         loss.backward()
 
         optimizer.step()
-        scheduler.step()
 
         # exponential moving average
         loss_avg = loss_avg * 0.8 + float(loss) * 0.2
-
-        if i > 50:
-            print(f"loss_avg {loss_avg}")
-            break
 
     state['train_loss'] = loss_avg
 
@@ -320,12 +352,68 @@ def train(epoch):
 
 
 if __name__ == '__main__':
-    for epoch in range(args.epochs):
-        # print(args.epochs)
+    # Logging
+    # if not os.path.exists(args.save):
+    #     os.makedirs(args.save)
+    if not os.path.isdir(args.save):
+        raise Exception('%s is not a dir' % args.save)
+    with open(os.path.join(args.save, args.dataset + split_indicator + '_' + args.model +
+                                '_' + str(args.loss_weight) + \
+                                '_' + str(args.sample_number)+ '_' + str(args.start_epoch) + '_' +\
+                                str(args.select) + '_' + str(args.sample_from) +
+                                '_training_results.csv'), 'w') as f:
+        f.write('epoch,time(s),train_loss,val_loss,val_error(%)\n')
+
+
+    for epoch in range(start_epoch, args.epochs):
+        
+        begin_epoch = time.time()
+
         train(epoch)
-        if epoch % 10 == 0:
-            print(f"epoch: {epoch}")
-        if epoch == args.unfreeze_epoch:
-            print("unfreezed!")
-        if epoch == args.start_epoch:
-            print("sampling started!")
+        val()
+
+        # if args.model == 'kimia': # TODO adjust lr
+        #     if epoch == 15:
+        #         optimizer.param_groups[0]['lr'] *= args.learning_rate * 0.1
+        #     elif epoch == 20:
+        #         optimizer.param_groups[0]['lr'] *= args.learning_rate * 0.01
+        #     elif epoch == 25:
+        #         optimizer.param_groups[0]['lr'] *= args.learning_rate * 0.001
+
+        # Save model
+        torch.save(net.state_dict(),
+                os.path.join(args.save, args.dataset + split_indicator + '_' + args.model +
+                                '_' + str(args.loss_weight) + \
+                                '_' + str(args.sample_number)+ '_' + str(args.start_epoch) + '_' +\
+                                str(args.select) + '_' + str(args.sample_from) + '_' + 'epoch_'  + str(epoch) + '.pt'))
+        # Let us not waste space and delete the previous model
+        prev_path = os.path.join(args.save, args.dataset + split_indicator + '_' + args.model +
+                                '_' + str(args.loss_weight) + \
+                                '_' + str(args.sample_number)+ '_' + str(args.start_epoch) + '_' +\
+                                str(args.select) + '_' + str(args.sample_from)  + '_' + 'epoch_' + str(epoch - 1) + '.pt')
+        if os.path.exists(prev_path): os.remove(prev_path)
+
+        # Show results
+        with open(os.path.join(args.save, args.dataset + split_indicator + '_' + args.model +
+                                        '_' + str(args.loss_weight) + \
+                                        '_' + str(args.sample_number) + '_' + str(args.start_epoch) + '_' + \
+                                        str(args.select) + '_' + str(args.sample_from) +
+                                        '_training_results.csv'), 'a') as f:
+            f.write('%03d,%05d,%0.6f,%0.5f,%0.2f\n' % (
+                (epoch + 1),
+                time.time() - begin_epoch,
+                state['train_loss'],
+                state['val_loss'],
+                100 - (100. * state['val_accuracy']),
+            ))
+
+        # # print state with rounded decimals
+        # print({k: round(v, 4) if isinstance(v, float) else v for k, v in state.items()})
+
+        print('Epoch {0:3d} | Time {1:5d} | Train Loss {2:.4f} | Val Loss {3:.3f} | Val Error {4:.2f}'.format(
+            (epoch + 1),
+            int(time.time() - begin_epoch),
+            state['train_loss'],
+            state['val_loss'],
+            100 - (100. * state['val_accuracy']))
+        )
