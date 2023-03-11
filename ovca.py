@@ -11,9 +11,10 @@ import numpy as np
 import json
 import re
 import pdb
+import random 
 
 class OVCA(Dataset):
-    def __init__(self, img_json, chunk, transform=None, target_transform=None, idx_to_label=None, key_word='Tumor'):
+    def __init__(self, img_json, chunk, train_transform=None, target_transform=None, transform_prob=0.6, test_transform=None, idx_to_label=None, key_word='Tumor'):
         '''
         Class with images as a list of patch paths, labels as a list of int label indices, and dictionary idx_to_label. keyword Tumor is used to parse for histotypes in patch path
         stores self.images as [image paths]
@@ -24,9 +25,12 @@ class OVCA(Dataset):
             self.images = data['chunks'][chunk]['imgs']
             labels = [re.search(rf'/{key_word}/(.*?)/', s).group(1) for s in self.images]
             self.labels = [label_to_index[x] for x in labels]
-        self.transform = transform
+        self.train_transform = train_transform
         self.target_transform = target_transform
+        self.transform_prob = transform_prob
+        self.test_transform = test_transform 
         self.label_names = idx_to_label
+        self.train = chunk == 0
 
     def __len__(self):
         return len(self.images)
@@ -34,12 +38,41 @@ class OVCA(Dataset):
     def __getitem__(self, idx):
         label = self.labels[idx]
         image = Image.open(self.images[idx])
+        if self.train and random.random() > self.transform_prob and self.train_transform: # TODO: decouple
+            image = self.train_transform(image)
+        else:
+            image = self.test_transform(image)
+        if self.target_transform:
+            label = self.target_transform(label)
+        return image, label
+
+
+class OV_OOD(Dataset):
+    def __init__(self, patches_path, label, transform=None, target_transform=None):
+        self.images = self._find_png_files(patches_path)
+        self.label = label
+        self.transform = transform
+        self.target_transform = target_transform
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        label = self.label
+        image = Image.open(self.images[idx])
         if self.transform:
             image = self.transform(image)
         if self.target_transform:
             label = self.target_transform(label)
         return image, label
-        # return {'imgs': img, 'labels': label}
+    
+    def _find_png_files(self, directory):
+        png_files = []
+        for root, dirs, files in os.walk(directory):
+            for file in files:
+                if file.endswith(".png"):
+                    png_files.append(os.path.abspath(os.path.join(root, file)))
+        return png_files
 
 class OVMIL(Dataset):
     '''
@@ -53,7 +86,7 @@ class OVMIL(Dataset):
     labels              parse from name
     '''
     def __init__(self, dataset, batch_size, histotypes): 
-        pass
+        return None
 
     def __len__(self):
         return 0
@@ -61,4 +94,3 @@ class OVMIL(Dataset):
     def __getitem__(self, idx): 
         return None
         
-

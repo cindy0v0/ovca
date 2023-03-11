@@ -25,6 +25,7 @@ if __package__ is None:
     sys.path.append(path.dirname(path.dirname(path.abspath(__file__))))
     from utils.validation_dataset import validation_split
 
+# Dataset
 parser = argparse.ArgumentParser(description='Trains a VOS-OVCA Classifier',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument('--dataset', type=str, choices=['ovca'],
@@ -36,15 +37,15 @@ parser.add_argument('--histotypes', action='store', type=str, nargs="+",
                     help='space separated str IDs specifying histotype labels')
 parser.add_argument('--num_split', type=int, default=0,
                     help='index of current split, e.g. 0-2 for 3-fold cv')
-parser.add_argument('--freeze', type=bool, default=False)
+parser.add_argument('--freeze', '-f', action='store_true', 
+                    help='freeze convolutional layers during training')
 parser.add_argument('--unfreeze_epoch', type=int, default=40,
                     help='epoch at which to unfreeze pretrained layers')
 parser.add_argument('--seed', type=int, default=1,
                     help='seed for torch, cuda, and np')
 parser.add_argument('--model', '-m', type=str, default='wrn',
                     choices=['allconv', 'wrn', 'kimia'], help='Choose architecture.')
-# parser.add_argument('--calibration', '-c', action='store_true',                                                    # don't need
-#                     help='Train a model to be used for calibration. This holds out some data for validation.')
+
 # Optimization options
 parser.add_argument('--epochs', '-e', type=int, default=100, help='Number of epochs to train.')
 parser.add_argument('--learning_rate', '-lr', type=float, default=0.001, help='The initial learning rate.')
@@ -69,7 +70,7 @@ parser.add_argument('--sample_number', type=int, default=1000)
 parser.add_argument('--select', type=int, default=1)
 parser.add_argument('--sample_from', type=int, default=10000)
 parser.add_argument('--loss_weight', type=float, default=0.1)
-
+parser.add_argument('--threshold', type=float, default=0.05)
 
 
 args = parser.parse_args()
@@ -94,7 +95,7 @@ if args.dataset == 'ovca':
     num_classes = len(labels)
     class_weights = class_proportion(args.split_dir, args.histotypes).to('cuda')
 
-    train_data = OVCA(args.split_dir, chunk=0, train_transform=train_transform, target_transform=None, test_transform=test_transform, idx_to_label=labels, key_word='Tumor')
+    train_data = OVCA(args.split_dir, chunk=0, train_transform=test_transform, target_transform=None, test_transform=test_transform, idx_to_label=labels, key_word='Tumor') # TODO
     val_data = OVCA(args.split_dir, chunk=1, test_transform=test_transform, target_transform=None, idx_to_label=labels, key_word='Tumor')
     test_data = OVCA(args.split_dir, chunk=2, test_transform=test_transform, target_transform=None, idx_to_label=labels, key_word='Tumor')
 
@@ -113,10 +114,10 @@ if args.model == 'allconv':
     net = AllConvNet(num_classes)
     num_channels = 0 # TODO
 elif args.model == 'kimia':
-    net = KimiaNet(num_classes, freeze=False)
+    net = KimiaNet(num_classes, freeze=args.freeze)
     num_channels = net.model.classifier.in_features # embedding dimension
 else:
-    net = WideResNet50_2(num_classes=num_classes, freeze=False)
+    net = WideResNet50_2(num_classes=num_classes, freeze=args.freeze)
     num_channels = net.model.fc.in_features # embedding dimension
 
 split_indicator = '_' + str(args.num_split)
@@ -252,7 +253,8 @@ def train(epoch):
         data_dict = queue
         number_dict = length of queue for each class
         '''
-        sum_temp = 0
+        sum_temp = 0 
+        prob = [0] # TODO: online
         for index in range(num_classes):
             sum_temp += number_dict[index]
         lr_reg_loss = torch.zeros(1).cuda()[0]
@@ -283,20 +285,46 @@ def train(epoch):
             temp_precision = torch.mm(X.t(), X) / len(X)
             temp_precision += 0.0001 * eye_matrix
 
+            if torch.isnan(temp_precision).any():
+                print(f"nan in temp_precision!")
+                pdb.set_trace()
+            if torch.isnan(mean_embed_id).any():
+                print(f"nan in means!")
+                pdb.set_trace()
 
             for index in range(num_classes):
                 new_dis = torch.distributions.multivariate_normal.MultivariateNormal(
                     mean_embed_id[index], covariance_matrix=temp_precision)
                 negative_samples = new_dis.rsample((args.sample_from,))
                 prob_density = new_dis.log_prob(negative_samples)
+                
                 # breakpoint()
-                # index_prob = (prob_density < - self.threshold).nonzero().view(-1)
                 # keep the data in the low density area.
+                '''
+                # TODO: 
+                index_prob = (prob_density < args.threshold).nonzero().view(-1)
+
+                cur_samples, index_topk = torch.topk(- prob_density, args.select)
+                cur_samples = negative_samples[index_topk and index_prob] # TODO: syntax
+
+                if cur_samples.size(0) == 0:
+                    cur_samples = negative_samples[index_topk[0]]
+                    cur_prob = new_dis.log_prob(cur_samples)
+                    if len(prob) < args.sample_number:
+                        prob.append(cur_prob)
+                    else:
+                        prob = prob[1:] + [cur_prob]
+                if index == 0:
+                    ood_samples = cur_samples # negative_samples[index_topk]
+                else:
+                    ood_samples = torch.cat((ood_samples, cur_samples), 0)
+                '''
                 cur_samples, index_prob = torch.topk(- prob_density, args.select)
                 if index == 0:
                     ood_samples = negative_samples[index_prob]
                 else:
                     ood_samples = torch.cat((ood_samples, negative_samples[index_prob]), 0)
+                
             if len(ood_samples) != 0:
                 # add some gaussian noise
                 # ood_samples = self.noise(ood_samples)
@@ -346,6 +374,9 @@ def train(epoch):
         loss_avg = loss_avg * 0.8 + float(loss) * 0.2
 
     state['train_loss'] = loss_avg
+    # state['avg_log_prob'] = np.mean(prob) # TODO
+    # state['std_log_prob'] = np.std(prob)
+    
 
 
 
@@ -387,11 +418,11 @@ if __name__ == '__main__':
                                 '_' + str(args.sample_number)+ '_' + str(args.start_epoch) + '_' +\
                                 str(args.select) + '_' + str(args.sample_from) + '_' + 'epoch_'  + str(epoch) + '.pt'))
         # Let us not waste space and delete the previous model
-        prev_path = os.path.join(args.save, args.dataset + split_indicator + '_' + args.model +
-                                '_' + str(args.loss_weight) + \
-                                '_' + str(args.sample_number)+ '_' + str(args.start_epoch) + '_' +\
-                                str(args.select) + '_' + str(args.sample_from)  + '_' + 'epoch_' + str(epoch - 1) + '.pt')
-        if os.path.exists(prev_path): os.remove(prev_path)
+        # prev_path = os.path.join(args.save, args.dataset + split_indicator + '_' + args.model +
+        #                         '_' + str(args.loss_weight) + \
+        #                         '_' + str(args.sample_number)+ '_' + str(args.start_epoch) + '_' +\
+        #                         str(args.select) + '_' + str(args.sample_from)  + '_' + 'epoch_' + str(epoch - 1) + '.pt')
+        # if os.path.exists(prev_path): os.remove(prev_path)
 
         # Show results
         with open(os.path.join(args.save, args.dataset + split_indicator + '_' + args.model +

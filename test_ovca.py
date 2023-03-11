@@ -16,6 +16,10 @@ from models.densenet import DenseNet3
 from skimage.filters import gaussian as gblur
 from PIL import Image as PILImage
 
+from models.kimianet_virtual import KimiaNet
+from models.wrn50_virtual import WideResNet50_2
+from ovca import OVCA, OV_OOD
+
 # go through rigamaroo to do ...utils.display_results import show_performance
 if __package__ is None:
     import sys
@@ -26,19 +30,28 @@ if __package__ is None:
     import utils.svhn_loader as svhn
     import utils.lsun_loader as lsun_loader
     import utils.score_calculation as lib
+    from utils_ovca import preprocess_load
 
-parser = argparse.ArgumentParser(description='Evaluates a CIFAR OOD Detector',
+parser = argparse.ArgumentParser(description='Evaluates a OVCA OOD Detector',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 # Setup
 parser.add_argument('--test_bs', type=int, default=200)
 parser.add_argument('--num_to_avg', type=int, default=1, help='Average measures across num_to_avg runs.')
 parser.add_argument('--validate', '-v', action='store_true', help='Evaluate performance on validation distributions.')
 parser.add_argument('--use_xent', '-x', action='store_true', help='Use cross entropy scoring instead of the MSP.')
-parser.add_argument('--method_name', '-m', type=str, default='cifar10_allconv_baseline', help='Method name.')
+parser.add_argument('--method_name', '-m', type=str, default='ovca', help='Method name.')
+# OVCA
+parser.add_argument('--split_dir', type=str, default='', 
+                    help='json split produced by create splits')
+parser.add_argument('--histotypes', action='store', type=str, nargs="+", 
+                    help='space separated str IDs specifying histotype labels')
+parser.add_argument('--num_split', type=int, default=0,
+                    help='index of current split, e.g. 0-2 for 3-fold cv')
+parser.add_argument('--ood_dir', type=str, default='', help='root directory to rare ov patches by subtype')
 # Loading details
 parser.add_argument('--layers', default=40, type=int, help='total number of layers')
 parser.add_argument('--widen-factor', default=2, type=int, help='widen factor')
-parser.add_argument('--droprate', default=0.3, type=float, help='dropout probability')
+parser.add_argument('--drop_rate', default=0.3, type=float, help='dropout probability')
 parser.add_argument('--load', '-l', type=str, default='./snapshots', help='Checkpoint path to resume / test.')
 parser.add_argument('--ngpu', type=int, default=1, help='0 = CPU.')
 parser.add_argument('--prefetch', type=int, default=2, help='Pre-fetching threads.')
@@ -47,7 +60,7 @@ parser.add_argument('--out_as_pos', action='store_true', help='OE define OOD dat
 parser.add_argument('--score', default='MSP', type=str, help='score options: MSP|energy')
 parser.add_argument('--T', default=1., type=float, help='temperature: energy|Odin')
 parser.add_argument('--noise', type=float, default=0, help='noise for Odin')
-parser.add_argument('--model_name', default='res', type=str)
+parser.add_argument('--model_name', default='kimia', type=str)
 
 args = parser.parse_args()
 print(args)
@@ -55,56 +68,59 @@ print(args)
 # np.random.seed(1)
 
 # mean and standard deviation of channels of CIFAR-10 images
-mean = [x / 255 for x in [125.3, 123.0, 113.9]]
-std = [x / 255 for x in [63.0, 62.1, 66.7]]
+mean = [x / 255 for x in [207.79, 177.028, 209.72]]
+std = [x / 255 for x in [28.79, 33.26, 18.41]]
 
 test_transform = trn.Compose([trn.ToTensor(), trn.Normalize(mean, std)])
 
-if 'cifar10_' in args.method_name:
-    test_data = dset.CIFAR10('/projects/ovcare/classification/cshi/OoD/vos/classification/CIFAR/snapshots/cifar', train=False, transform=test_transform)
-    num_classes = 10
-else:
-    test_data = dset.CIFAR100('/projects/ovcare/classification/cshi/OoD/vos/classification/CIFAR/snapshots/cifar', train=False, transform=test_transform)
-    num_classes = 100
+if 'ovca' in args.method_name:
+    labels = args.histotypes
+    num_classes = len(labels)
+    test_data = OVCA(args.split_dir, chunk=2, test_transform=test_transform, target_transform=None, idx_to_label=labels, key_word='Tumor')
+    # ood_data = OV_OOD(args.ood)
 
 
 test_loader = torch.utils.data.DataLoader(test_data, batch_size=args.test_bs, shuffle=False,
                                           num_workers=args.prefetch, pin_memory=True)
-
 # Create model
 if args.model_name == 'res':
-    net = WideResNet(args.layers, num_classes, args.widen_factor, dropRate=args.droprate)
-else:
-    net = DenseNet3(100, num_classes, 12, reduction=0.5, bottleneck=True, dropRate=0.0, normalizer=None,
-                         k=None, info=None)
+    net = WideResNet50_2(num_classes=num_classes, drop_rate=args.drop_rate, freeze=False)
+else: 
+    net = KimiaNet(num_classes=num_classes, drop_rate=args.drop_rate, freeze=False)
+    
+
+start_epoch = 0
 
 if args.ngpu > 1:
     net = torch.nn.DataParallel(net, device_ids=list(range(args.ngpu)))
 
 if args.ngpu > 0:
     net.cuda()
-    # torch.cuda.manual_seed(1)
-    
+
 # Restore model
-if args.load != '':    
-    model_name = args.load
-    if os.path.isfile(model_name):
-        net.load_state_dict(torch.load(model_name))
-        print('Model restored! Epoch:')
-        # start_epoch = i + 1
-    
+if args.load != '':
+    if os.path.isfile(args.load):
+        state_dict = preprocess_load(args.load, args.ngpu) # TODO: change state_dict 
+        net.load_state_dict(state_dict)
+        print('Model restored!')
+    else:
+        assert False, "could not resume "+ args.load
+
 net.eval()
+
+# torch.cuda.manual_seed(1)
 
 cudnn.benchmark = True  # fire on all cylinders
 
 # /////////////// Detection Prelims ///////////////
 
-ood_num_examples = len(test_data) // 5
-expected_ap = ood_num_examples / (ood_num_examples + len(test_data))
+# ood_num_examples = len(ood_data)
+# expected_ap = ood_num_examples / (ood_num_examples + len(test_data))
 
 concat = lambda x: np.concatenate(x, axis=0)
 to_np = lambda x: x.data.cpu().numpy()
 
+num_examples = 0 # TODO: does not support M
 
 def get_ood_scores(loader, in_dist=False):
     _score = []
@@ -113,12 +129,9 @@ def get_ood_scores(loader, in_dist=False):
 
     with torch.no_grad():
         for batch_idx, (data, target) in enumerate(loader):
-            if batch_idx >= ood_num_examples // args.test_bs and in_dist is False:
-                break
-
             data = data.cuda()
 
-            output = net(data)
+            output, _ = net(data)
             smax = to_np(F.softmax(output, dim=1))
 
             if args.use_xent:
@@ -145,28 +158,27 @@ def get_ood_scores(loader, in_dist=False):
     if in_dist:
         return concat(_score).copy(), concat(_right_score).copy(), concat(_wrong_score).copy()
     else:
-        return concat(_score)[:ood_num_examples].copy()
+        return concat(_score).copy()
+
+        
 if args.score == 'Odin':
     # separated because no grad is not applied
-    in_score, right_score, wrong_score = lib.get_ood_scores_odin(test_loader, net, args.test_bs, ood_num_examples, args.T, args.noise, in_dist=True)
+    in_score, right_score, wrong_score = lib.get_ood_scores_odin(test_loader, net, args.test_bs, args.T, args.noise, in_dist=True)
 elif args.score == 'M':
     from torch.autograd import Variable
     _, right_score, wrong_score = get_ood_scores(test_loader, in_dist=True)
 
-
-    if 'cifar10_' in args.method_name:
-        train_data = dset.CIFAR10('/nobackup-slow/dataset/cifarpy', train=True, transform=test_transform)
-    else:
-        train_data = dset.CIFAR100('/nobackup-slow/dataset/cifarpy', train=True, transform=test_transform)
-
+    if 'ovca' in args.method_name:
+        train_data = OVCA(args.split_dir, chunk=0, target_transform=None, test_transform=test_transform, idx_to_label=labels, key_word='Tumor') # TODO
+    
     train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.test_bs, shuffle=False, 
                                           num_workers=args.prefetch, pin_memory=True)
-    num_batches = ood_num_examples // args.test_bs
+    num_batches = num_examples // args.test_bs # TODOs
 
-    temp_x = torch.rand(2,3,32,32)
+    temp_x = torch.rand(2,3,512,512) # ??? TODO
     temp_x = Variable(temp_x)
     temp_x = temp_x.cuda()
-    temp_list = net.feature_list(temp_x)[1]
+    temp_list = net.feature_list(temp_x)[1] # TODO
     num_output = len(temp_list)
     feature_list = np.empty(num_output)
     count = 0
@@ -183,28 +195,29 @@ else:
 
 num_right = len(right_score)
 num_wrong = len(wrong_score)
-print('Error Rate {:.2f}'.format(100 * num_wrong / (num_wrong + num_right)))
+print('ID Error Rate {:.3f} %'.format(100 * num_wrong / (num_wrong + num_right)))
 
 # /////////////// End Detection Prelims ///////////////
 
-print('\nUsing CIFAR-10 as typical data') if num_classes == 10 else print('\nUsing CIFAR-100 as typical data')
+# print('\nUsing OVCA as typical data') if num_classes == 10 else print('\nUsing CIFAR-100 as typical data')
 
 # /////////////// Error Detection ///////////////
 
 print('\n\nError Detection')
 show_performance(wrong_score, right_score, method_name=args.method_name)
 
-# /////////////// OOD Detection ///////////////
-auroc_list, aupr_list, fpr_list = [], [], []
 
+
+# /////////////// OOD Detection ///////////////
+auroc_list, aupr_list, fpr_list, acc_list = [], [], [], []
 
 def get_and_print_results(ood_loader, num_to_avg=args.num_to_avg):
 
-    aurocs, auprs, fprs = [], [], []
+    aurocs, auprs, fprs, acc = [], [], [], []
 
     for _ in range(num_to_avg):
         if args.score == 'Odin':
-            out_score = lib.get_ood_scores_odin(ood_loader, net, args.test_bs, ood_num_examples, args.T, args.noise)
+            out_score = lib.get_ood_scores_odin(ood_loader, net, args.test_bs, args.T, args.noise)
         elif args.score == 'M':
             out_score = lib.get_Mahalanobis_score(net, ood_loader, num_classes, sample_mean, precision, count-1, args.noise, num_batches)
         else:
@@ -214,9 +227,12 @@ def get_and_print_results(ood_loader, num_to_avg=args.num_to_avg):
         else:
             measures = get_measures(-in_score, -out_score)
         aurocs.append(measures[0]); auprs.append(measures[1]); fprs.append(measures[2])
-    print(in_score[:3], out_score[:3])
-    auroc = np.mean(aurocs); aupr = np.mean(auprs); fpr = np.mean(fprs)
-    auroc_list.append(auroc); aupr_list.append(aupr); fpr_list.append(fpr)
+    print(in_score[:3], out_score[:3]) # TODO: change into mean and std of all energy
+    print(np.mean(in_score), np.mean(out_score))
+    print(np.std(in_score), np.std(out_score))
+    
+    auroc = np.mean(aurocs); aupr = np.mean(auprs); fpr = np.mean(fprs); acc = np.mean(acc)
+    auroc_list.append(auroc); aupr_list.append(aupr); fpr_list.append(fpr); acc_list.append(acc)
 
     if num_to_avg >= 5:
         print_measures_with_std(aurocs, auprs, fprs, args.method_name)
@@ -224,80 +240,25 @@ def get_and_print_results(ood_loader, num_to_avg=args.num_to_avg):
         print_measures(auroc, aupr, fpr, args.method_name)
 
 
-# /////////////// Textures ///////////////
-# ood_data = dset.ImageFolder(root="/nobackup-slow/dataset/dtd/images",
-#                             transform=trn.Compose([trn.Resize(32), trn.CenterCrop(32),
-#                                                    trn.ToTensor(), trn.Normalize(mean, std)]), download=True)
-# ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
-#                                          num_workers=4, pin_memory=True)
-# print('\n\nTexture Detection')
-# get_and_print_results(ood_loader)
+subdirs = os.listdir(args.ood_dir)
+type_to_idx = {v: k + num_classes for k, v in enumerate(subdirs)} # TODO: coupling? 
+# ood_dir = [os.path.join(args.ood_dir, x) for x in ood]
+for subdir in subdirs:
+    path = os.path.join(args.ood_dir, subdir)
+    
+    print(f'\n{subdir} Detection')
+    ood_data = OV_OOD(path, type_to_idx[subdir], transform=test_transform)
+    ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=False, num_workers=args.prefetch, pin_memory=True)
 
-# /////////////// SVHN /////////////// # cropped and no sampling of the test set
-ood_data = svhn.SVHN(root='/projects/ovcare/classification/cshi/OoD/vos/classification/CIFAR/snapshots/test_dset/svhn', split="test",
-                     transform=trn.Compose(
-                         [#trn.Resize(32),
-                         trn.ToTensor(), trn.Normalize(mean, std)]), download=True)
-ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
-                                         num_workers=2, pin_memory=True)
-print('\n\nSVHN Detection')
-get_and_print_results(ood_loader)
+    get_and_print_results(ood_loader)
 
-# /////////////// Places365 ///////////////
-# ood_data = dset.ImageFolder(root="/nobackup-slow/dataset/places365/",
-#                             transform=trn.Compose([trn.Resize(32), trn.CenterCrop(32),
-#                                                    trn.ToTensor(), trn.Normalize(mean, std)]))
-# ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
-#                                          num_workers=2, pin_memory=True)
-# print('\n\nPlaces365 Detection')
-# get_and_print_results(ood_loader)
-
-# /////////////// LSUN-C ///////////////
-# ood_data = dset.ImageFolder(root="/nobackup-slow/dataset/LSUN_C",
-#                             transform=trn.Compose([trn.ToTensor(), trn.Normalize(mean, std)]))
-# ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
-#                                          num_workers=1, pin_memory=True)
-# print('\n\nLSUN_C Detection')
-# get_and_print_results(ood_loader)
-
-# /////////////// LSUN-R ///////////////
-# ood_data = dset.ImageFolder(root="/projects/ovcare/classification/cshi/OoD/vos/classification/CIFAR/snapshots/test_dset/LSUN_resize",
-#                             transform=trn.Compose([trn.ToTensor(), trn.Normalize(mean, std)]))
-# ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
-#                                          num_workers=1, pin_memory=True)
-# print('\n\nLSUN_Resize Detection')
-# get_and_print_results(ood_loader)
-
-# /////////////// iSUN ///////////////
-# ood_data = dset.ImageFolder(root="/projects/ovcare/classification/cshi/OoD/vos/classification/CIFAR/snapshots/test_dset/iSUN",
-#                             transform=trn.Compose([trn.ToTensor(), trn.Normalize(mean, std)]))
-# ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
-#                                          num_workers=1, pin_memory=True)
-# print('\n\niSUN Detection')
-# get_and_print_results(ood_loader)
-
-# /////////////// Mean Results ///////////////
 
 print('\n\nMean Test Results!!!!!')
 print_measures(np.mean(auroc_list), np.mean(aupr_list), np.mean(fpr_list), method_name=args.method_name)
 
 
-# /////////////// CIFAR-100 ///////////////
-ood_data = dset.CIFAR100('/projects/ovcare/classification/cshi/OoD/vos/classification/CIFAR/snapshots/cifar', train=False,
-                          transform=trn.Compose([trn.ToTensor(), trn.Normalize(mean, std)]), download=True)
-ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
-                                         num_workers=1, pin_memory=True)
-print('\n\nCIFAR-100 Detection')
-get_and_print_results(ood_loader)
 
-# /////////////// celeba ///////////////
-# ood_data = dset.ImageFolder(root="/projects/ovcare/classification/cshi/OoD/vos/classification/CIFAR/snapshots/test_dset/celeba",
-#                             transform=trn.Compose([trn.Resize(32), trn.CenterCrop(32),
-#                                 trn.ToTensor(), trn.Normalize((.5, .5, .5), (.5, .5, .5))]), download=True)
-# ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
-#                                          num_workers=1, pin_memory=True)
-# print('\n\nceleba Detection')
-# get_and_print_results(ood_loader)
+
 
 
 # /////////////// OOD Detection of Validation Distributions ///////////////
@@ -309,9 +270,9 @@ auroc_list, aupr_list, fpr_list = [], [], []
 
 # /////////////// Uniform Noise ///////////////
 
-dummy_targets = torch.ones(ood_num_examples * args.num_to_avg)
+dummy_targets = torch.ones(num_examples * args.num_to_avg)
 ood_data = torch.from_numpy(
-    np.random.uniform(size=(ood_num_examples * args.num_to_avg, 3, 32, 32),
+    np.random.uniform(size=(num_examples * args.num_to_avg, 3, 32, 32),
                       low=-1.0, high=1.0).astype(np.float32))
 ood_data = torch.utils.data.TensorDataset(ood_data, dummy_targets)
 ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True)
@@ -323,9 +284,9 @@ get_and_print_results(ood_loader)
 # /////////////// Arithmetic Mean of Images ///////////////
 
 if 'cifar10_' in args.method_name:
-    ood_data = dset.CIFAR100('/projects/ovcare/classification/cshi/OoD/vos/classification/CIFAR/snapshots/cifar', train=False, transform=test_transform)
+    ood_data = dset.CIFAR100('/nobackup-slow/dataset/cifarpy', train=False, transform=test_transform)
 else:
-    ood_data = dset.CIFAR10('/projects/ovcare/classification/cshi/OoD/vos/classification/CIFAR/snapshots/cifar', train=False, transform=test_transform)
+    ood_data = dset.CIFAR10('/nobackup-slow/dataset/cifarpy', train=False, transform=test_transform)
 
 
 class AvgOfPair(torch.utils.data.Dataset):
@@ -356,9 +317,9 @@ get_and_print_results(ood_loader)
 # /////////////// Geometric Mean of Images ///////////////
 
 if 'cifar10_' in args.method_name:
-    ood_data = dset.CIFAR100('/projects/ovcare/classification/cshi/OoD/vos/classification/CIFAR/snapshots/cifar', train=False, transform=trn.ToTensor())
+    ood_data = dset.CIFAR100('/nobackup-slow/dataset/cifarpy', train=False, transform=trn.ToTensor())
 else:
-    ood_data = dset.CIFAR10('/projects/ovcare/classification/cshi/OoD/vos/classification/CIFAR/snapshots/cifar', train=False, transform=trn.ToTensor())
+    ood_data = dset.CIFAR10('/nobackup-slow/dataset/cifarpy', train=False, transform=trn.ToTensor())
 
 
 class GeomMeanOfPair(torch.utils.data.Dataset):
