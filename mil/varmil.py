@@ -1,7 +1,9 @@
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class VarMIL(nn.Module):
-    def __init__(self, in_size):
+    def __init__(self, in_size=1024, dim=128, num_classes=5):
         super().__init__()
         dim = 128 # ? 
         torch.autograd.set_detect_anomaly(True)
@@ -11,7 +13,7 @@ class VarMIL(nn.Module):
                                        nn.Linear(dim, 1))
         self.classifier = nn.Sequential(nn.Linear(2*in_size, dim),
                                        nn.ReLU(),
-                                       nn.Linear(dim, 5))
+                                       nn.Linear(dim, num_classes))
 
     def forward(self, x):
         """
@@ -38,4 +40,5 @@ class VarMIL(nn.Module):
         V = V * nb_patch[:, None]                                      # broadcasting
         M_V = torch.cat((M, V), dim=1)
         out = self.classifier(M_V)
-        return out
+        return out, A
+
