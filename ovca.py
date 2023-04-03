@@ -1,4 +1,5 @@
 import os
+import glob
 from PIL import Image
 import torch
 import torch.nn as nn
@@ -77,20 +78,105 @@ class OV_OOD(Dataset):
 class OVMIL(Dataset):
     '''
     init effects
-    dataset             directory of .pt files, nb_patch x embedding_size, 1 per slide. Naming convention: patient_id, histotype <-- should prioritize batches from the same patient = ordered dir & shuffle=False
-    batch_size          size to pad nb_patch if < batch_size
+    dataset             root_dir of image embeddings as .pt files. Path structure: 'root_dir/class_label/*.pt'
+    histotypes          list of histotype labels
     label_to_idx        reverse mapping of histotypes
-
-    getitem returns
-    patches             padded .pt
-    labels              parse from name
     '''
-    def __init__(self, dataset, batch_size, histotypes): 
-        return None
+    def __init__(self, dataset, histotypes, debug=False): 
+        self.dataset = dataset
+        self.histotypes = histotypes
+        self.debug = debug
+        self.label_to_idx = {v: k for k, v in enumerate(histotypes)}
+        self.images, self.labels = self._find_pt_files(dataset)
 
     def __len__(self):
-        return 0
+        return len(self.images)
 
     def __getitem__(self, idx): 
-        return None
+        label = self.labels[idx]
+        image = torch.load(self.images[idx]) 
+        return image, label
         
+    def _find_pt_files(self, root_dir):
+        pt_files = []
+        labels = []
+        for class_label in os.listdir(root_dir):
+            class_path = os.path.join(root_dir, class_label)
+            image_embs = glob.glob(f"{class_path}/*.pt")
+            pt_files.extend(image_embs)
+            labels.extend([self.label_to_idx[class_label]] * len(image_embs))
+
+        if self.debug:
+            pdb.set_trace()
+            x = torch.load(pt_files[0])
+            print(f"Found {len(pt_files)} pt files in {root_dir} with {label[:5]} histotypes")
+            print(f"{x.sum()}, {x.shape}, {type(x)}")
+        return pt_files, labels
+
+class OVEM(Dataset):
+    def __init__(self, dataset, histotypes, debug=False, ood=False):
+        self.dataset = dataset
+        self.histotypes = histotypes
+        self.debug = debug
+        self.label_to_idx = {v: k for k, v in enumerate(histotypes)}
+        self.images, self.labels = self._find_pt_files(dataset)
+        self.scores = [path.replace("embeddings_150", "scores_150") for path in self.images] # list of path to scores
+        if ood:
+            self.scores = [path.replace("embeddings_150", "scores_rare") for path in self.images] # list of path to scores
+        if debug:
+            print("entered OVEM")
+            print(self.scores[:5])
+
+    def __len__(self):
+        return len(self.images)
+    
+    def __getitem__(self, idx):
+        label = self.labels[idx]
+        image = torch.load(self.images[idx]).cpu()
+        image = image[~torch.all(image == 0, dim=1)] # remove zero rows
+        score = self.scores[idx]
+        return image, label, score
+
+    def _find_pt_files(self, root_dir):
+        pt_files = []
+        labels = []
+        for class_label in os.listdir(root_dir):
+            class_path = os.path.join(root_dir, class_label)
+            image_embs = glob.glob(f"{class_path}/*.pt")
+            pt_files.extend(image_embs)
+            labels.extend([self.label_to_idx[class_label]] * len(image_embs))
+
+        if self.debug:
+            # pdb.set_trace()
+            x = torch.load(pt_files[0])
+            print(f"Found {len(pt_files)} pt files in {root_dir} with {labels[:5]} histotypes")
+            print(f"{x.sum()}, {x.shape}, {type(x)}")
+        return pt_files, labels
+
+    def get_images(self):
+        return self.images
+
+class OVSCORE(Dataset):
+    def __init__(self, dataset, debug=False):
+        self.dataset = dataset
+        self.scores = self._find_score_files(dataset)
+
+    def __len__(self):
+        return len(self.scores)
+
+    def __getitem__(self, idx):
+        score = torch.load(self.scores[idx])
+        return score
+    
+    def _find_score_files(self, dataset):
+        scores = []
+        for class_label in os.listdir(dataset):
+            class_path = os.path.join(dataset, class_label)
+            image_scores = glob.glob(f"{class_path}/*.pt")
+            scores.extend(image_scores)
+        if self.debug:
+            # pdb.set_trace()
+            x = torch.load(scores[0])
+            print(f"Found {len(scores)} score files in {dataset}")
+            print(f"{x.sum()}, {x.shape}, {type(x)}")
+        return scores

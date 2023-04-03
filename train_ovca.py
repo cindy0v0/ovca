@@ -1,5 +1,6 @@
 import numpy as np
 import os
+import re
 import argparse
 import time
 import torch
@@ -13,7 +14,7 @@ from tqdm import tqdm
 import pdb
 from mil.varmil import VarMIL
 from ovca import OVCA, OVMIL
-from utils_ovca import class_proportion
+from utils_ovca import class_proportion, preprocess_load
 from models.allconv import AllConvNet
 from models.kimianet_virtual import KimiaNet
 from models.wrn50_virtual import WideResNet50_2
@@ -118,7 +119,7 @@ elif args.model == 'kimia':
     num_channels = net.model.classifier.in_features # embedding dimension
 else:
     net = WideResNet50_2(num_classes=num_classes, freeze=args.freeze)
-    num_channels = net.model.fc.in_features # embedding dimension
+    num_channels = net.in_features # embedding dimension
 
 split_indicator = '_' + str(args.num_split)
 
@@ -136,10 +137,13 @@ if args.ngpu > 0:
 # restore model 
 start_epoch = 0
 if not args.load == '':
-    net.load_state_dict(torch.load(args.load))
-    i = args.load[-4]
+    net.load_state_dict(preprocess_load(args.load, args.ngpu))
+    temp = str.split(args.load, '_')[-1]
+    i = re.sub("[^0-9]", "", temp)
     print('Model restored! Epoch:', i)
-    start_epoch = i + 1
+    start_epoch = int(i) + 1
+if start_epoch > 10:
+    start_epoch = 10
 
 cudnn.benchmark = True  # find algorithms for best runtime
 
@@ -271,6 +275,9 @@ def train(epoch):
                 dict_key = target_numpy[index]
                 data_dict[dict_key] = torch.cat((data_dict[dict_key][1:],
                                                       output[index].detach().view(1, -1)), 0)
+            if torch.isnan(data_dict).any():
+                print("nan in data_dict!")
+                pdb.set_trace()
             # the covariance finder needs the data to be centered.
             for index in range(num_classes):
                 if index == 0:
@@ -286,10 +293,10 @@ def train(epoch):
             temp_precision += 0.0001 * eye_matrix
 
             if torch.isnan(temp_precision).any():
-                print(f"nan in temp_precision!")
+                print("nan in temp_precision!")
                 pdb.set_trace()
             if torch.isnan(mean_embed_id).any():
-                print(f"nan in means!")
+                print("nan in means!")
                 pdb.set_trace()
 
             for index in range(num_classes):
@@ -300,25 +307,6 @@ def train(epoch):
                 
                 # breakpoint()
                 # keep the data in the low density area.
-                '''
-                # TODO: 
-                index_prob = (prob_density < args.threshold).nonzero().view(-1)
-
-                cur_samples, index_topk = torch.topk(- prob_density, args.select)
-                cur_samples = negative_samples[index_topk and index_prob] # TODO: syntax
-
-                if cur_samples.size(0) == 0:
-                    cur_samples = negative_samples[index_topk[0]]
-                    cur_prob = new_dis.log_prob(cur_samples)
-                    if len(prob) < args.sample_number:
-                        prob.append(cur_prob)
-                    else:
-                        prob = prob[1:] + [cur_prob]
-                if index == 0:
-                    ood_samples = cur_samples # negative_samples[index_topk]
-                else:
-                    ood_samples = torch.cat((ood_samples, cur_samples), 0)
-                '''
                 cur_samples, index_prob = torch.topk(- prob_density, args.select)
                 if index == 0:
                     ood_samples = negative_samples[index_prob]
@@ -330,16 +318,22 @@ def train(epoch):
                 # ood_samples = self.noise(ood_samples)
                 # energy_score_for_fg = 1 * torch.logsumexp(predictions[0][selected_fg_samples][:, :-1] / 1, 1)
                 energy_score_for_fg = log_sum_exp(x, 1)
+                if torch.isnan(energy_score_for_fg).any(): # debug
+                    print("nan in energy_score_for_fg!")
+                    pdb.set_trace()
                 if args.model == 'kimia':
                     predictions_ood = net.module.model.classifier(ood_samples)
                 elif args.model == 'wrn':
-                    predictions_ood = net.module.model.fc(ood_samples)
+                    predictions_ood = net.model.fc(ood_samples) # TODO: ngpu = 1
                 else: # args.model == 'allconv
                     predictions_ood = net.fc(ood_samples) 
                 # TODO: not good!
 
                 # energy_score_for_bg = 1 * torch.logsumexp(predictions_ood[0][:, :-1] / 1, 1)
                 energy_score_for_bg = log_sum_exp(predictions_ood, 1)
+                if torch.isnan(energy_score_for_bg).any(): # debug
+                    print("nan in energy_score_for_bg!")
+                    pdb.set_trace()
 
                 input_for_lr = torch.cat((energy_score_for_fg, energy_score_for_bg), -1)
                 labels_for_lr = torch.cat((torch.ones(len(output)).cuda(),
@@ -374,6 +368,7 @@ def train(epoch):
         loss_avg = loss_avg * 0.8 + float(loss) * 0.2
 
     state['train_loss'] = loss_avg
+    state['reg_loss'] = float(loss)
     # state['avg_log_prob'] = np.mean(prob) # TODO
     # state['std_log_prob'] = np.std(prob)
     
@@ -383,8 +378,8 @@ def train(epoch):
 
 if __name__ == '__main__':
     # Logging
-    # if not os.path.exists(args.save):
-    #     os.makedirs(args.save)
+    if not os.path.exists(args.save):
+        os.makedirs(args.save)
     if not os.path.isdir(args.save):
         raise Exception('%s is not a dir' % args.save)
     with open(os.path.join(args.save, args.dataset + split_indicator + '_' + args.model +
@@ -392,7 +387,7 @@ if __name__ == '__main__':
                                 '_' + str(args.sample_number)+ '_' + str(args.start_epoch) + '_' +\
                                 str(args.select) + '_' + str(args.sample_from) +
                                 '_training_results.csv'), 'w') as f:
-        f.write('epoch,time(s),train_loss,val_loss,val_error(%)\n')
+        f.write('epoch,time(s),train_loss,reg_loss,val_loss,val_error(%)\n')
 
 
 
@@ -403,13 +398,13 @@ if __name__ == '__main__':
         train(epoch)
         val()
 
-        # if args.model == 'kimia': # TODO adjust lr
-        #     if epoch == 15:
-        #         optimizer.param_groups[0]['lr'] *= args.learning_rate * 0.1
-        #     elif epoch == 20:
-        #         optimizer.param_groups[0]['lr'] *= args.learning_rate * 0.01
-        #     elif epoch == 25:
-        #         optimizer.param_groups[0]['lr'] *= args.learning_rate * 0.001
+        if args.model == 'kimia': # TODO adjust lr
+            if epoch == 12:
+                optimizer.param_groups[0]['lr'] *= args.learning_rate * 0.1
+            elif epoch == 18:
+                optimizer.param_groups[0]['lr'] *= args.learning_rate * 0.01
+            elif epoch == 22:
+                optimizer.param_groups[0]['lr'] *= args.learning_rate * 0.001
 
         # Save model
         torch.save(net.state_dict(),
@@ -430,10 +425,11 @@ if __name__ == '__main__':
                                         '_' + str(args.sample_number) + '_' + str(args.start_epoch) + '_' + \
                                         str(args.select) + '_' + str(args.sample_from) +
                                         '_training_results.csv'), 'a') as f:
-            f.write('%03d,%05d,%0.6f,%0.5f,%0.2f\n' % (
+            f.write('%03d,%05d,%0.6f,%0.6f,%0.5f,%0.2f\n' % (
                 (epoch + 1),
                 time.time() - begin_epoch,
                 state['train_loss'],
+                state['reg_loss'],
                 state['val_loss'],
                 100 - (100. * state['val_accuracy']),
             ))
@@ -441,10 +437,11 @@ if __name__ == '__main__':
         # # print state with rounded decimals
         # print({k: round(v, 4) if isinstance(v, float) else v for k, v in state.items()})
 
-        print('Epoch {0:3d} | Time {1:5d} | Train Loss {2:.4f} | Val Loss {3:.3f} | Val Error {4:.2f}'.format(
+        print('Epoch {0:3d} | Time {1:5d} | Train Loss {2:.4f} | Reg Loss {3:.3f} | Val Loss {4:.3f} | Val Error {5:.2f}'.format(
             (epoch + 1),
             int(time.time() - begin_epoch),
             state['train_loss'],
+            state['reg_loss'],
             state['val_loss'],
             100 - (100. * state['val_accuracy']))
         )
