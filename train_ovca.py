@@ -17,6 +17,7 @@ from ovca import OVCA, OVMIL
 from utils_ovca import class_proportion, preprocess_load
 from models.allconv import AllConvNet
 from models.kimianet_virtual import KimiaNet
+from models.densenet import DenseNet3
 from models.wrn50_virtual import WideResNet50_2
 
 if __package__ is None:
@@ -45,7 +46,7 @@ parser.add_argument('--unfreeze_epoch', type=int, default=40,
 parser.add_argument('--seed', type=int, default=1,
                     help='seed for torch, cuda, and np')
 parser.add_argument('--model', '-m', type=str, default='wrn',
-                    choices=['allconv', 'wrn', 'kimia'], help='Choose architecture.')
+                    choices=['allconv', 'wrn', 'kimia', 'dense'], help='Choose architecture.')
 
 # Optimization options
 parser.add_argument('--epochs', '-e', type=int, default=100, help='Number of epochs to train.')
@@ -62,6 +63,7 @@ parser.add_argument('--droprate', default=0.3, type=float, help='dropout probabi
 parser.add_argument('--save', '-s', type=str, default='./snapshots/ovca', help='Folder to save checkpoints.')
 parser.add_argument('--load', '-l', type=str, default='', help='Checkpoint path to resume / test.')
 parser.add_argument('--test', '-t', action='store_true', help='Test only flag.')
+parser.add_argument('--save_freq', type=int, default=1, help='Save frequency.')
 # Acceleration
 parser.add_argument('--ngpu', type=int, default=1, help='0 = CPU.')
 parser.add_argument('--prefetch', type=int, default=4, help='Pre-fetching threads.')
@@ -82,7 +84,6 @@ print(state)
 torch.manual_seed(args.seed)
 np.random.seed(args.seed)
 
-# computed from subset (1/6) of Ov_van
 mean = [x / 255 for x in [207.79, 177.028, 209.72]]
 std = [x / 255 for x in [28.79, 33.26, 18.41]]
 
@@ -101,7 +102,7 @@ if args.dataset == 'ovca':
     test_data = OVCA(args.split_dir, chunk=2, test_transform=test_transform, target_transform=None, idx_to_label=labels, key_word='Tumor')
 
 train_loader = torch.utils.data.DataLoader(
-    train_data, batch_size=args.batch_size, shuffle=True, # TODO : debug
+    train_data, batch_size=args.batch_size, shuffle=True,
     num_workers=args.prefetch, pin_memory=True)
 test_loader = torch.utils.data.DataLoader(
     test_data, batch_size=args.test_bs, shuffle=False, 
@@ -116,17 +117,17 @@ if args.model == 'allconv':
     num_channels = 0 # TODO
 elif args.model == 'kimia':
     net = KimiaNet(num_classes, freeze=args.freeze)
-    num_channels = net.model.classifier.in_features # embedding dimension
-else:
+    num_channels = net.emb_dim # embedding dimension
+elif args.model == 'dense':
+    net = DenseNet3(100, num_classes)
+    num_channels = net.in_planes # embedding dimension
+elif args.model == 'wrn':
     net = WideResNet50_2(num_classes=num_classes, freeze=args.freeze)
-    num_channels = net.in_features # embedding dimension
+    num_channels = net.emb_dim # embedding dimension
 
 split_indicator = '_' + str(args.num_split)
 
-# Initialize GPU
-# TODO: distributedparallel
-# import torch.distributed as dist6
-# import torch.multiprocessing as mp
+
 if args.ngpu > 1:
     net = torch.nn.DataParallel(net, device_ids=list(range(args.ngpu)))
 
@@ -136,25 +137,23 @@ if args.ngpu > 0:
 
 # restore model 
 start_epoch = 0
-if not args.load == '':
+if not args.load == '':  
     net.load_state_dict(preprocess_load(args.load, args.ngpu))
     temp = str.split(args.load, '_')[-1]
     i = re.sub("[^0-9]", "", temp)
     print('Model restored! Epoch:', i)
     start_epoch = int(i) + 1
-if start_epoch > 10:
-    start_epoch = 10
 
-cudnn.benchmark = True  # find algorithms for best runtime
+cudnn.benchmark = True  
 
-# Initialize VOS components = weight_energy and logistic_regression <-- extract? 
+# Initialize VOS components = weight_energy and logistic_regression
 weight_energy = torch.nn.Linear(num_classes, 1).cuda()
 torch.nn.init.uniform_(weight_energy.weight)
 data_dict = torch.zeros(num_classes, args.sample_number, num_channels).cuda()
 number_dict = {}
 for i in range(num_classes):
     number_dict[i] = 0
-eye_matrix = torch.eye(num_channels, device='cuda') # was 128, replaced with num_channel 
+eye_matrix = torch.eye(num_channels, device='cuda') 
 logistic_regression = torch.nn.Linear(1, 2)
 logistic_regression = logistic_regression.cuda()
 
@@ -234,9 +233,6 @@ def val():
     state['val_accuracy'] = correct / len(val_loader.dataset)
 
 
-
-# sample = next(iter(train_loader))
-
 # Training
 def train(epoch):
     # unfreeze training if frozen
@@ -258,7 +254,6 @@ def train(epoch):
         number_dict = length of queue for each class
         '''
         sum_temp = 0 
-        prob = [0] # TODO: online
         for index in range(num_classes):
             sum_temp += number_dict[index]
         lr_reg_loss = torch.zeros(1).cuda()[0]
@@ -314,9 +309,6 @@ def train(epoch):
                     ood_samples = torch.cat((ood_samples, negative_samples[index_prob]), 0)
                 
             if len(ood_samples) != 0:
-                # add some gaussian noise
-                # ood_samples = self.noise(ood_samples)
-                # energy_score_for_fg = 1 * torch.logsumexp(predictions[0][selected_fg_samples][:, :-1] / 1, 1)
                 energy_score_for_fg = log_sum_exp(x, 1)
                 if torch.isnan(energy_score_for_fg).any(): # debug
                     print("nan in energy_score_for_fg!")
@@ -325,14 +317,14 @@ def train(epoch):
                     predictions_ood = net.module.model.classifier(ood_samples)
                 elif args.model == 'wrn':
                     predictions_ood = net.model.fc(ood_samples) # TODO: ngpu = 1
-                else: # args.model == 'allconv
+                else: # args.model == allconv cifar_dense or cifar_wrn
                     predictions_ood = net.fc(ood_samples) 
-                # TODO: not good!
+                # TODO: fix the  switch on type
 
                 # energy_score_for_bg = 1 * torch.logsumexp(predictions_ood[0][:, :-1] / 1, 1)
                 energy_score_for_bg = log_sum_exp(predictions_ood, 1)
                 if torch.isnan(energy_score_for_bg).any(): # debug
-                    print("nan in energy_score_for_bg!")
+                    print(f"nan in energy_score_for_bg! epoch: {epoch}")
                     pdb.set_trace()
 
                 input_for_lr = torch.cat((energy_score_for_fg, energy_score_for_bg), -1)
@@ -343,9 +335,9 @@ def train(epoch):
                 output1 = logistic_regression(input_for_lr.view(-1, 1))
                 lr_reg_loss = criterion(output1, labels_for_lr.long())
 
-                # if torch.isnan(lr_reg_loss):
-                #     print(f"nan! energy_score: {energy_score_for_bg}, {energy_score_for_fg}, i: {i}, epoch: {epoch}")
-                #     pdb.set_trace()
+                if torch.isnan(lr_reg_loss):
+                    print(f"nan! energy_score: {energy_score_for_bg}, {energy_score_for_fg}, i: {i}, epoch: {epoch}")
+                    pdb.set_trace()
 
         else:
             target_numpy = target.cpu().data.numpy()
@@ -377,18 +369,13 @@ def train(epoch):
 
 
 if __name__ == '__main__':
-    # Logging
+
     if not os.path.exists(args.save):
         os.makedirs(args.save)
     if not os.path.isdir(args.save):
         raise Exception('%s is not a dir' % args.save)
-    with open(os.path.join(args.save, args.dataset + split_indicator + '_' + args.model +
-                                '_' + str(args.loss_weight) + \
-                                '_' + str(args.sample_number)+ '_' + str(args.start_epoch) + '_' +\
-                                str(args.select) + '_' + str(args.sample_from) +
-                                '_training_results.csv'), 'w') as f:
+    with open(os.path.join(args.save, 'training_results.csv'), 'w') as f:
         f.write('epoch,time(s),train_loss,reg_loss,val_loss,val_error(%)\n')
-
 
 
     for epoch in range(start_epoch, args.epochs):
@@ -398,20 +385,21 @@ if __name__ == '__main__':
         train(epoch)
         val()
 
-        if args.model == 'kimia': # TODO adjust lr
-            if epoch == 12:
+        if args.model == 'dense': # TODO adjust lr
+            if epoch == 20:
                 optimizer.param_groups[0]['lr'] *= args.learning_rate * 0.1
-            elif epoch == 18:
+            elif epoch == 30:
                 optimizer.param_groups[0]['lr'] *= args.learning_rate * 0.01
-            elif epoch == 22:
+            elif epoch == 40:
                 optimizer.param_groups[0]['lr'] *= args.learning_rate * 0.001
 
-        # Save model
-        torch.save(net.state_dict(),
-                os.path.join(args.save, args.dataset + split_indicator + '_' + args.model +
-                                '_' + str(args.loss_weight) + \
-                                '_' + str(args.sample_number)+ '_' + str(args.start_epoch) + '_' +\
-                                str(args.select) + '_' + str(args.sample_from) + '_' + 'epoch_'  + str(epoch) + '.pt'))
+        # Save models
+        if epoch % args.save_freq == 0:
+            torch.save(net.state_dict(),
+                    os.path.join(args.save, f'net_{epoch}.pt'))
+            torch.save(weight_energy.state_dict(), os.path.join(args.save, f'weight_energy_{epoch}.pt'))
+            torch.save(logistic_regression.state_dict(), os.path.join(args.save, f'logistic_regression_{epoch}.pt'))
+
         # Let us not waste space and delete the previous model
         # prev_path = os.path.join(args.save, args.dataset + split_indicator + '_' + args.model +
         #                         '_' + str(args.loss_weight) + \
@@ -420,11 +408,7 @@ if __name__ == '__main__':
         # if os.path.exists(prev_path): os.remove(prev_path)
 
         # Show results
-        with open(os.path.join(args.save, args.dataset + split_indicator + '_' + args.model +
-                                        '_' + str(args.loss_weight) + \
-                                        '_' + str(args.sample_number) + '_' + str(args.start_epoch) + '_' + \
-                                        str(args.select) + '_' + str(args.sample_from) +
-                                        '_training_results.csv'), 'a') as f:
+        with open(os.path.join(args.save, 'training_results.csv'), 'a') as f:
             f.write('%03d,%05d,%0.6f,%0.6f,%0.5f,%0.2f\n' % (
                 (epoch + 1),
                 time.time() - begin_epoch,

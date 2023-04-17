@@ -79,22 +79,31 @@ class OVMIL(Dataset):
     '''
     init effects
     dataset             root_dir of image embeddings as .pt files. Path structure: 'root_dir/class_label/*.pt'
+                        update: json file containing paths to .pt
     histotypes          list of histotype labels
     label_to_idx        reverse mapping of histotypes
+    
+    getitem:  image     150 x 1024 padded embedding
+              target    histotype 1 x 1
     '''
-    def __init__(self, dataset, histotypes, debug=False): 
-        self.dataset = dataset
+    def __init__(self, dataset, split, histotypes, debug=False, ood=False, num_id_classes=5, key_word='embeds'):
         self.histotypes = histotypes
         self.debug = debug
         self.label_to_idx = {v: k for k, v in enumerate(histotypes)}
-        self.images, self.labels = self._find_pt_files(dataset)
+        if ood:
+            self.label_to_idx = {v: k + num_id_classes for k, v in enumerate(histotypes)}
+        with open(dataset) as f:
+            data = json.load(f)
+            self.images = data['chunks'][split]['imgs']
+            labels = [re.search(rf'/{key_word}/(.*?)/', s).group(1) for s in self.images]
+            self.labels = [self.label_to_idx[x] for x in labels]
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx): 
         label = self.labels[idx]
-        image = torch.load(self.images[idx]) 
+        image = torch.load(self.images[idx]).cpu()
         return image, label
         
     def _find_pt_files(self, root_dir):
@@ -102,30 +111,34 @@ class OVMIL(Dataset):
         labels = []
         for class_label in os.listdir(root_dir):
             class_path = os.path.join(root_dir, class_label)
-            image_embs = glob.glob(f"{class_path}/*.pt")
+            image_embs = sorted(glob.glob(f"{class_path}/*.pt"))
             pt_files.extend(image_embs)
             labels.extend([self.label_to_idx[class_label]] * len(image_embs))
-
-        if self.debug:
-            pdb.set_trace()
-            x = torch.load(pt_files[0])
-            print(f"Found {len(pt_files)} pt files in {root_dir} with {label[:5]} histotypes")
-            print(f"{x.sum()}, {x.shape}, {type(x)}")
         return pt_files, labels
 
+
 class OVEM(Dataset):
-    def __init__(self, dataset, histotypes, debug=False, ood=False):
+    '''
+    getitem: image     n_patch x 1024 select=1 kimia embedding (padding filtered)
+             target    histotype 1 x 1
+             score     path to where patch/slide level scores will be stored (harded coded to be */score_150/*.pt if id and */score_rare/*.pt if ood)
+                       need to manually edit .pt names to avoid overwriting :)
+    '''
+    def __init__(self, dataset, histotypes, debug=False, ood=False, num_id_classes=5):
         self.dataset = dataset
         self.histotypes = histotypes
         self.debug = debug
         self.label_to_idx = {v: k for k, v in enumerate(histotypes)}
+        if ood:
+            self.label_to_idx = {v: k + num_id_classes for k, v in enumerate(histotypes)}
         self.images, self.labels = self._find_pt_files(dataset)
         self.scores = [path.replace("embeddings_150", "scores_150") for path in self.images] # list of path to scores
         if ood:
-            self.scores = [path.replace("embeddings_150", "scores_rare") for path in self.images] # list of path to scores
-        if debug:
-            print("entered OVEM")
-            print(self.scores[:5])
+            self.scores = [path.replace("embeddings_rare", "scores_rare") for path in self.images] # list of path to scores
+            print(f"Using rare scores {dataset}")
+            print(f"Using rare scores {len(self.images)}")
+            x = torch.load(self.images[0]).cpu()
+            print(f"x shape {x.shape}")
 
     def __len__(self):
         return len(self.images)
@@ -133,7 +146,7 @@ class OVEM(Dataset):
     def __getitem__(self, idx):
         label = self.labels[idx]
         image = torch.load(self.images[idx]).cpu()
-        image = image[~torch.all(image == 0, dim=1)] # remove zero rows
+        image = image[~torch.all(image == 0, dim=1)]
         score = self.scores[idx]
         return image, label, score
 
@@ -142,7 +155,7 @@ class OVEM(Dataset):
         labels = []
         for class_label in os.listdir(root_dir):
             class_path = os.path.join(root_dir, class_label)
-            image_embs = glob.glob(f"{class_path}/*.pt")
+            image_embs = sorted(glob.glob(f"{class_path}/*.pt"))
             pt_files.extend(image_embs)
             labels.extend([self.label_to_idx[class_label]] * len(image_embs))
 
@@ -159,20 +172,22 @@ class OVEM(Dataset):
 class OVSCORE(Dataset):
     def __init__(self, dataset, debug=False):
         self.dataset = dataset
+        self.debug = debug
         self.scores = self._find_score_files(dataset)
 
     def __len__(self):
         return len(self.scores)
 
     def __getitem__(self, idx):
-        score = torch.load(self.scores[idx])
-        return score
+        score = torch.load(self.scores[idx]).cpu()
+        score_pth = self.scores[idx]
+        return score, score_pth
     
     def _find_score_files(self, dataset):
         scores = []
         for class_label in os.listdir(dataset):
             class_path = os.path.join(dataset, class_label)
-            image_scores = glob.glob(f"{class_path}/*.pt")
+            image_scores = sorted(glob.glob(f"{class_path}/*.pt"))
             scores.extend(image_scores)
         if self.debug:
             # pdb.set_trace()

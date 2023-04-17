@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import torchvision.transforms as trn
 import torchvision.datasets as dset
+import torchvision
 import torch.nn.functional as F
 # from models.wrn import WideResNet
 # from models.densenet import DenseNet3
@@ -160,7 +161,7 @@ def get_ood_scores(loader, in_dist=False):
     else:
         return concat(_score).copy()
 
-        
+
 if args.score == 'Odin':
     # separated because no grad is not applied
     in_score, right_score, wrong_score = lib.get_ood_scores_odin(test_loader, net, args.test_bs, args.T, args.noise, in_dist=True)
@@ -193,6 +194,7 @@ elif args.score == 'M':
 else:
     in_score, right_score, wrong_score = get_ood_scores(test_loader, in_dist=True)
 
+
 num_right = len(right_score)
 num_wrong = len(wrong_score)
 print('ID Error Rate {:.3f} %'.format(100 * num_wrong / (num_wrong + num_right)))
@@ -203,7 +205,7 @@ print('ID Error Rate {:.3f} %'.format(100 * num_wrong / (num_wrong + num_right))
 
 # /////////////// Error Detection ///////////////
 
-print('\n\nError Detection')
+print('\n\nError Detection') 
 show_performance(wrong_score, right_score, method_name=args.method_name)
 
 
@@ -247,17 +249,49 @@ for subdir in subdirs:
     path = os.path.join(args.ood_dir, subdir)
     
     print(f'\n{subdir} Detection')
-    ood_data = OV_OOD(path, type_to_idx[subdir], transform=test_transform)
-    ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=False, num_workers=args.prefetch, pin_memory=True)
+    # ood_data = OV_OOD(path, type_to_idx[subdir], transform=test_transform)
+    # ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=False, num_workers=args.prefetch, pin_memory=True)
 
-    get_and_print_results(ood_loader)
+    # get_and_print_results(ood_loader) TODO
+
+# TODO
+# print('\n\nMean Test Results!!!!!')
+# print_measures(np.mean(auroc_list), np.mean(aupr_list), np.mean(fpr_list), method_name=args.method_name)
 
 
-print('\n\nMean Test Results!!!!!')
-print_measures(np.mean(auroc_list), np.mean(aupr_list), np.mean(fpr_list), method_name=args.method_name)
+ood_data = svhn.SVHN(root='/projects/ovcare/classification/cshi/OoD/vos/classification/CIFAR/snapshots/test_dset/svhn', split="test",
+                     transform=trn.Compose(
+                         [#trn.Resize(32),
+                         trn.ToTensor(), trn.Normalize(mean, std)]), download=True)
+ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
+                                         num_workers=2, pin_memory=True)
+print('\n\nSVHN Detection')
+get_and_print_results(ood_loader)
 
+print('\n\nMNIST Detection')
+transform = trn.Compose([
+    trn.Resize(32),  # Resize the image to 32x32
+    trn.Grayscale(num_output_channels=3),  # Convert grayscale to RGB by duplicating the channel
+    trn.ToTensor(),  # Convert the PIL image to a PyTorch tensor
+])
 
+# Load the MNIST dataset using torchvision and apply the transform pipeline
+train_dataset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+test_dataset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
 
+# Create data loaders for the MNIST dataset
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.test_bs, shuffle=True)
+test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.test_bs, shuffle=False)
+
+get_and_print_results(test_loader)
+
+print('\n\nCIFAR100 Detection')
+ood_data = dset.CIFAR100('/projects/ovcare/classification/cshi/OoD/vos/classification/CIFAR/snapshots/cifar', train=False,
+                          transform=trn.Compose([trn.ToTensor(), trn.Normalize(mean, std)]), download=True)
+ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
+                                         num_workers=1, pin_memory=True)
+print('\n\nCIFAR-100 Detection')
+get_and_print_results(ood_loader)
 
 
 

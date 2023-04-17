@@ -6,25 +6,17 @@ import os
 import pdb
 
 class KimiaNet(nn.Module):
-    def __init__(self, num_classes=5, freeze=False, drop_rate=0.0, state_dict_path='/projects/ovcare/classification/cshi/OoD/vos/classification/CIFAR/snapshots/baseline/KimiaNetPyTorchWeights_new.pth'):
-        '''
-        load weights & customize final layer
-        '''
+    def __init__(self, num_classes=5, dim=None, freeze=False, drop_rate=0.0, state_dict_path='./data/baseline/DensePretrainedWeights.pth'):
         super(KimiaNet, self).__init__()
+        # load pretrained weights on TCGA,which has 30 classes
         self.model = torchvision.models.densenet121(num_classes=30, drop_rate=drop_rate)
         state_dict = torch.load(state_dict_path, map_location = torch.device('cpu'))
         self.model.load_state_dict(state_dict)
 
+        # set classifier to desired num of classes
         num_ftrs = self.model.classifier.in_features
         self.model.classifier = torch.nn.Linear(num_ftrs, num_classes)
-
-        nn.init.kaiming_normal_(self.model.classifier.weight.data, nonlinearity="relu")
-        self.model.classifier.bias.data = torch.zeros(size=self.model.classifier.bias.size()).cuda()
-
-        if freeze:
-            for name, param in self.model.named_parameters():
-                if not name.startswith('classifier'):
-                    param.requires_grad = False
+        self.emb_dim = num_ftrs
     
     def forward(self, x):
         features = self.model.features(x)

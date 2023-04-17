@@ -8,8 +8,8 @@ from torch.nn import DataParallel
 from mil.varmil import VarMIL
 from ovca import OVCA, OVMIL
 
-# import torch.multiprocessing as mp
-# mp.set_start_method('spawn', force=True)
+import torch.multiprocessing as mp
+mp.set_start_method('spawn', force=True)
 
 
 def train_varmil(model, dataloader, criterion, optimizer, device):
@@ -22,7 +22,7 @@ def train_varmil(model, dataloader, criterion, optimizer, device):
         data, target = data.to(device), target.to(device)
 
         optimizer.zero_grad()
-        out = model(data)
+        out, A = model(data)
         loss = criterion(out, target)
         loss.backward()
         optimizer.step()
@@ -44,7 +44,7 @@ def val_mil(model, dataloader, criterion, device):
         for batch_idx, (data, target) in enumerate(dataloader):
             data, target = data.to(device), target.to(device)
 
-            out = model(data)
+            out, A = model(data)
             loss = criterion(out, target)
 
             running_loss += loss.item()
@@ -70,7 +70,8 @@ def main():
                         help='space separated str IDs specifying histotype labels')
     parser.add_argument('--save', type=str, default='', 
                         help='path to save the trained model. will be created if it does not exist. will be saved as model_args-run_epoch.pt')
-    parser.add_argument('--run', type=str, default='run0')
+    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--run', type=str, default='0')
     parser.add_argument('--load', type=str, default='')
     parser.add_argument('--save_freq', type=int, default=1)
     parser.add_argument('--epochs', '-e', type=int, default=10)
@@ -86,15 +87,19 @@ def main():
 
     print("Loading data...")
     # Load the dataset
-    dataset = OVMIL(dataset=args.dataset, histotypes=args.histotypes)
-    train_set, test_set, val_set = create_splits(dataset)
+    train_set = OVMIL(dataset=args.dataset, split=0, histotypes=args.histotypes)
+    val_set = OVMIL(dataset=args.dataset, split=1, histotypes=args.histotypes)
+    test_set = OVMIL(dataset=args.dataset, split=2, histotypes=args.histotypes)
+    if args.debug:
+        print(f"train_set: {len(train_set)}, train_set[0][0] emb tensor.shape: {train_set[0][0].shape}, train_set[0][1] label: {train_set[0][1]}")
+        print(f"train_set[0][0][:5]: {train_set[0][0][:5]}")
     train_dataloader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4)
     val_dataloader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
     test_dataloader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     print("Creating model...")
     # Define variables for training
-    in_size = 1024
+    in_size = train_set[0][0].shape[1] # 1024
     model = VarMIL(in_size)
     model.to(device)
     if args.ngpu > 1:
